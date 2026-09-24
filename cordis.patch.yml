@@ -1,0 +1,3 @@
+- insert:
+    - id: rdfoe-workflow
+      name: '@rdfoe/dsh-workflow'

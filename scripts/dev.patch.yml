@@ -1,0 +1,4 @@
+# Dev/e2e overlay: enables the /api/rdfoe-wf/dev/* routes. Never use in a real profile.
+- id: rdfoe-workflow
+  config:
+    devRoutes: true

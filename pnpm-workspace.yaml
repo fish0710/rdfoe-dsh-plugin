@@ -1,0 +1,5 @@
+onlyBuiltDependencies:
+  - '@deepseek-ai/dsh-subprocess-local'
+  - node-pty
+  - koffi
+  - protobufjs

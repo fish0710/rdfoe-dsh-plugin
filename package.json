@@ -1,0 +1,78 @@
+{
+  "name": "@rdfoe/dsh-workflow",
+  "version": "0.1.0-beta.5",
+  "description": "RDFOE 本地工作流插件（DeepSeek Harness）：设计→审核→计划→审核→实施⇄验收→审核，一会话一工作流，跨会话统一收件箱",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc -p .",
+    "test": "vitest run",
+    "fake-llm": "node test/fake-llm/server.mjs",
+    "dev:web": "scripts/dev-web.sh",
+    "dev:stop": "scripts/stop-dev.sh",
+    "e2e": "node test/e2e/run.mjs",
+    "prepublishOnly": "pnpm test && pnpm build",
+    "release:beta": "pnpm publish --tag beta --no-git-checks"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-agent": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-client-connection": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-home-paths": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-llm": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-session": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-subagent": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-tools": "0.1.7-alpha.2",
+    "@deepseek-ai/schemastery": "~3.18.4"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-agent": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-api-session-controller": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-client-connection": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-client-ui-slots": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-client-ui-tool": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-home-paths": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-llm": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-session": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-subagent": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-system-prompt": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-tools": "0.1.7-alpha.2",
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "@types/node": "^24.13.6",
+    "@types/react": "~18.3.31",
+    "@types/react-dom": "~18.3.7",
+    "react": "^18.3.1",
+    "tsdown": "^0.22.14",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.11"
+  },
+  "publishConfig": {
+    "tag": "beta"
+  }
+}
