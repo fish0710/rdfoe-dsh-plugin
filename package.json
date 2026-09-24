@@ -1,6 +1,6 @@
 {
   "name": "@rdfoe/dsh-workflow",
-  "version": "0.1.0-beta.5",
+  "version": "0.1.0-beta.6",
   "description": "RDFOE 本地工作流插件（DeepSeek Harness）：设计→审核→计划→审核→实施⇄验收→审核，一会话一工作流，跨会话统一收件箱",
   "type": "module",
   "main": "lib/index.js",

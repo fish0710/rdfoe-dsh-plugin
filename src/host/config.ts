@@ -13,8 +13,10 @@ export interface Config {
   plan?: { split?: boolean }
   loop: { stallRounds: number, remindAt: number }
   run: { autoResume: boolean }
-  exec: { timeoutMs: number, outputBytes: number }
-  write: { maxBytes: number }
+  /** Deprecated (0.1.0-beta.6): nodes use DSH's native bash and file tools with their own limits; ignored. */
+  exec?: { timeoutMs?: number, outputBytes?: number }
+  /** Deprecated (0.1.0-beta.6): see exec; ignored. */
+  write?: { maxBytes?: number }
   message: { maxPerAgent: number }
   maxConcurrentAgents: number
   defaultModel?: ModelRouteConfig
@@ -37,11 +39,8 @@ export const Config: Schema<Config> = Schema.object({
     remindAt: Schema.natural().min(1).default(10),
   }).default({ stallRounds: 3, remindAt: 10 }),
   run: Schema.object({ autoResume: Schema.boolean().default(false) }).default({ autoResume: false }),
-  exec: Schema.object({
-    timeoutMs: Schema.natural().min(1000).default(600_000).description('wf_exec timeout (ms)'),
-    outputBytes: Schema.natural().min(1024).default(32_768).description('wf_exec stdout/stderr tail kept per stream'),
-  }).default({ timeoutMs: 600_000, outputBytes: 32_768 }),
-  write: Schema.object({ maxBytes: Schema.natural().min(1).default(1024 * 1024) }).default({ maxBytes: 1024 * 1024 }),
+  exec: Schema.object({ timeoutMs: Schema.natural(), outputBytes: Schema.natural() }).description('Deprecated: nodes use DSH\'s native bash (its own timeout and output limits); ignored'),
+  write: Schema.object({ maxBytes: Schema.natural() }).description('Deprecated: nodes use DSH\'s native file tools; ignored'),
   message: Schema.object({ maxPerAgent: Schema.natural().min(1).default(20) }).default({ maxPerAgent: 20 }),
   maxConcurrentAgents: Schema.natural().min(1).default(4),
   defaultModel: route.description('Fallback route when neither the node config nor the main session supplies one'),

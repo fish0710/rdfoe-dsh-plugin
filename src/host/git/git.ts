@@ -4,22 +4,24 @@
  * and the archive. Never push, never merge. Everything runs through execFile (no shell).
  */
 import { execFile } from 'node:child_process'
-import { mkdir } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { mkdir, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 
 export interface GitResult { code: number, stdout: string, stderr: string }
 
-export function git(cwd: string, args: string[], options: { signal?: AbortSignal, maxBuffer?: number } = {}): Promise<GitResult> {
+export function git(cwd: string, args: string[], options: { signal?: AbortSignal, maxBuffer?: number, env?: Record<string, string> } = {}): Promise<GitResult> {
   return new Promise((resolve) => {
-    execFile('git', args, { cwd, maxBuffer: options.maxBuffer ?? 16 * 1024 * 1024, signal: options.signal, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }, (error, stdout, stderr) => {
+    execFile('git', args, { cwd, maxBuffer: options.maxBuffer ?? 16 * 1024 * 1024, signal: options.signal, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...options.env } }, (error, stdout, stderr) => {
       const code = error ? (typeof (error as { code?: unknown }).code === 'number' ? (error as { code: number }).code : 1) : 0
       resolve({ code, stdout: String(stdout), stderr: String(stderr) })
     })
   })
 }
 
-async function ok(cwd: string, args: string[]): Promise<string> {
-  const r = await git(cwd, args)
+async function ok(cwd: string, args: string[], env?: Record<string, string>): Promise<string> {
+  const r = await git(cwd, args, { env })
   if (r.code !== 0) throw new Error(`git ${args.join(' ')} failed: ${r.stderr.trim() || r.stdout.trim()}`)
   return r.stdout.trim()
 }
@@ -66,4 +68,26 @@ export async function diffSinceBase(worktree: string, baseRef: string, maxBytes 
 export async function branchLog(worktree: string, baseRef: string): Promise<string[]> {
   const r = await git(worktree, ['log', '--format=%h %s', `${baseRef}..HEAD`])
   return r.stdout.trim() === '' ? [] : r.stdout.trim().split('\n')
+}
+
+/**
+ * Tree id of the whole working tree (tracked and untracked, honouring
+ * .gitignore), built in a throwaway index so the real index and HEAD stay
+ * untouched. Two snapshots compared with {@link changedPaths} show what an
+ * agent changed in between, whichever tool it used.
+ */
+export async function snapshotTree(worktree: string): Promise<string> {
+  const index = join(tmpdir(), `rdfoe-index-${randomUUID()}`)
+  try {
+    await ok(worktree, ['add', '-A'], { GIT_INDEX_FILE: index })
+    return await ok(worktree, ['write-tree'], { GIT_INDEX_FILE: index })
+  } finally {
+    await rm(index, { force: true })
+  }
+}
+
+/** Workspace-relative paths that differ between two snapshot trees. */
+export async function changedPaths(worktree: string, from: string, to: string): Promise<string[]> {
+  const out = await ok(worktree, ['diff', '--name-only', '--no-renames', from, to])
+  return out === '' ? [] : out.split('\n')
 }

@@ -2,9 +2,10 @@
 /**
  * Acceptance e2e (keyless, fake LLM). Usage: node test/e2e/run.mjs [a b c d n s m k q]
  *  a) full template R → C → D ⇄ DR → H1 → T → V → H2 → X ⇄ Y → H3 → A:
- *     C sends a message and asks (b: the reply rides the next wf_* result);
+ *     C sends a message and asks (b: the reply is steered into the working agent);
  *     DR finds a blocker → back to D; H1 reject → D; V reads tasks.md;
- *     Y fails (write outside its scope refused, fix task appended) → X;
+ *     Y fails (native write outside its scope refused, a bash edit fails
+ *     wf_report until restored, fix task appended) → X;
  *     H3 shows acceptance.md, rejected → X → Y → approved → A writes
  *     archive.md with the human decisions → COMPLETED; commits + artifacts
  *  c) two sessions run concurrently; items handled through one inbox
@@ -25,7 +26,8 @@
  *  u) the web UI in a fresh headless Chrome: DSH's sidebar 工作区 block and
  *     the plugin's 收件箱 entry render, and no slot entry crashed
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
   api, assert, fakeRequests, git, log, makeSampleRepo, makeWorkspace, node, respond, runSnap, setScenario,
@@ -36,7 +38,8 @@ const selected = new Set(process.argv.slice(2).length ? process.argv.slice(2) : 
 const ws = makeWorkspace()
 log('workspace', ws.dir)
 
-const req = (content) => ({ name: 'wf_write', input: { path: '{dir}/requirement.md', content } })
+const req = (content) => ({ name: 'write', input: { file_path: '{dir}/requirement.md', content } })
+const bash = (command) => ({ name: 'bash', input: { command, description: 'Run a command' } })
 const SCENARIO = [
   // a + b: C sends a message, then asks a blocking question.
   { match: { title: 'A', role: 'C' }, calls: [
@@ -47,29 +50,37 @@ const SCENARIO = [
   ], say: 'clarified' },
   // a: the first design review blocks.
   { match: { title: 'A', role: 'DR', v: 1 }, calls: [
-    { name: 'wf_write', input: { path: '{dir}/review.md', content: '# 设计评审\n\n- F-1（阻断）：没有说明非数字输入的处理。\n\n## 结论\n不通过\n' } },
+    { name: 'write', input: { file_path: '{dir}/review.md', content: '# 设计评审\n\n- F-1（阻断）：没有说明非数字输入的处理。\n\n## 结论\n不通过\n' } },
     { name: 'wf_report', input: { summary: '设计审查：1 个阻断', artifacts: [], openIssues: [], confidence: 0.9, verdict: 'fail', items: [{ id: 'F-1', result: 'fail', evidence: 'design.md 未说明非数字输入的处理' }, { id: 'FR-1', result: 'pass', evidence: 'design.md 覆盖 FR-1' }] } },
   ], say: 'dr v1 blocked' },
   // a: X round 1 writes a bug, runs the test, then an unlisted shell pipeline.
   { match: { title: 'A', role: 'X', round: 1 }, calls: [
-    { name: 'wf_write', input: { path: 'src/add.js', content: 'module.exports = (a, b) => a - b\n' } },
-    { name: 'wf_exec', input: { command: 'npm test' } },
-    { name: 'wf_exec', input: { command: 'node --version && echo "shell ok" | tr a-z A-Z', reason: '确认 Node 版本' } },
-    { name: 'wf_write', input: { path: '{dir}/verification.md', content: '# 实施证据 第 {round} 轮\n' } },
+    { name: 'write', input: { file_path: 'src/add.js', content: 'module.exports = (a, b) => a - b\n' } },
+    bash('npm test'),
+    bash('node --version && echo "shell ok" | tr a-z A-Z'),
+    // Outside the platform temp area (the e2e worktree lives under tmpdir, which DSH's sandbox leaves writable).
+    bash('touch "$HOME/.rdfoe-e2e-sandbox-probe"; echo probe-exit=$?'),
+    { name: 'write', input: { file_path: '{dir}/verification.md', content: '# 实施证据 第 {round} 轮\n' } },
     { name: 'wf_report', input: { summary: '实现 add', artifacts: ['src/add.js'], openIssues: [], confidence: 0.7 } },
   ], say: 'x r1 done' },
-  // a: Y records, is refused an application-code write, appends a fix task, and fails the round.
+  // a: Y records; its write to application code is refused, a bash edit of it fails wf_report until
+  // restored; it appends a fix task and fails the round.
   { match: { title: 'A', role: 'Y', round: 1 }, calls: [
-    { name: 'wf_exec', input: { command: 'npm test' } },
-    { name: 'wf_write', input: { path: '{dir}/verification.md', content: '# 验证记录 第 {round} 轮\n\n- VP-1：npm test exit 1（add(2,3) !== 5），失败 → F-1\n' } },
-    { name: 'wf_write', input: { path: 'src/add.js', content: 'module.exports = (a, b) => a + b\n' } },
-    { name: 'wf_edit', input: { path: '{tasks}', old_text: '完成判据：npm test 通过\n', new_text: '完成判据：npm test 通过\n- [ ] T2 修复 F-1（VP-1：add(2,3) !== 5）；完成判据：npm test 通过\n' } },
+    bash('npm test'),
+    { name: 'write', input: { file_path: '{dir}/verification.md', content: '# 验证记录 第 {round} 轮\n\n- VP-1：npm test exit 1（add(2,3) !== 5），失败 → F-1\n' } },
+    { name: 'write', input: { file_path: 'src/add.js', content: 'module.exports = (a, b) => a + b\n' } },
+    bash('echo "// patched by Y" >> src/add.js'),
+    { name: 'read', input: { file_path: '{tasks}' } },
+    { name: 'edit', input: { file_path: '{tasks}', old_string: '完成判据：npm test 通过\n', new_string: '完成判据：npm test 通过\n- [ ] T2 修复 F-1（VP-1：add(2,3) !== 5）；完成判据：npm test 通过\n' } },
+    { name: 'wf_report', input: { summary: '验证未通过', artifacts: [], openIssues: [], confidence: 0.9, verdict: 'fail', items: [{ id: 'VP-1', result: 'fail', evidence: 'npm test exit 1: add(2,3) !== 5' }] } },
+    bash('git show HEAD:src/add.js > src/add.js'),
     { name: 'wf_report', input: { summary: '验证未通过', artifacts: [], openIssues: [], confidence: 0.9, verdict: 'fail', items: [{ id: 'VP-1', result: 'fail', evidence: 'npm test exit 1: add(2,3) !== 5' }] } },
   ], say: 'y r1 done' },
   { match: { title: 'A', role: 'X', round: 2 }, calls: [
-    { name: 'wf_edit', input: { path: 'src/add.js', old_text: 'a - b', new_text: 'a + b' } },
-    { name: 'wf_exec', input: { command: 'npm test' } },
-    { name: 'wf_write', input: { path: '{dir}/verification.md', content: '# 实施证据 第 {round} 轮\nT2：修复减号。\n' } },
+    { name: 'read', input: { file_path: 'src/add.js' } },
+    { name: 'edit', input: { file_path: 'src/add.js', old_string: 'a - b', new_string: 'a + b' } },
+    bash('npm test'),
+    { name: 'write', input: { file_path: '{dir}/verification.md', content: '# 实施证据 第 {round} 轮\nT2：修复减号。\n' } },
     { name: 'wf_report', input: { summary: '修复 F-1', artifacts: ['src/add.js'], openIssues: [], confidence: 0.9 } },
   ], say: 'x r2 done' },
   // d: R asks; the host restarts while it waits; the resumed agent finishes without asking again.
@@ -96,7 +107,7 @@ const SCENARIO = [
   ], say: 'k blocked' },
   // q: DR blocks every time.
   { match: { title: 'Q', role: 'DR' }, calls: [
-    { name: 'wf_write', input: { path: '{dir}/review.md', content: '# 设计评审 v{v}\n\n- F-1（阻断）：仍缺错误处理。\n' } },
+    { name: 'write', input: { file_path: '{dir}/review.md', content: '# 设计评审 v{v}\n\n- F-1（阻断）：仍缺错误处理。\n' } },
     { name: 'wf_report', input: { summary: '仍有阻断', artifacts: [], openIssues: [], confidence: 0.9, verdict: 'fail', items: [{ id: 'F-1', result: 'fail', evidence: 'design.md 仍缺错误处理' }] } },
   ], say: 'q blocked' },
 ]
@@ -128,8 +139,12 @@ async function scenarioA() {
   // D ⇄ DR: the first review blocks, D v2 answers it, DR v2 passes
   const h1 = await waitItem(sessionId, i => i.kind === 'review' && i.payload.gate === 'H1', 'H1 review item')
   const reqs = await fakeRequests()
-  assert(reqs.some(r => r.marker?.title === 'A' && r.marker.role === 'C' && r.lastToolResult.includes('答：不支持') && r.lastToolResult.includes('好的，按整数来')),
-    'b) the reply to wf_message came back with the next wf_* tool result (wf_ask), together with the answer')
+  const cReqs = reqs.filter(r => r.marker?.title === 'A' && r.marker.role === 'C')
+  log('C node tools:', cReqs[0]?.tools.join(', '))
+  assert(cReqs.some(r => r.lastToolResult.includes('答：不支持')), 'b) the blocking answer came back as the wf_ask result')
+  assert(cReqs.some(r => r.lastUserText.includes('【用户的新回复】') && r.lastUserText.includes('好的，按整数来')), 'b) the reply to wf_message reached the working agent as a steered user message')
+  assert(cReqs.every(r => r.tools.includes('write') && r.tools.includes('bash') && r.tools.includes('wf_ask') && !r.tools.includes('ask_user_question') && !r.tools.includes('wf_start') && !r.tools.some(t => /^wf_(read|write|edit|exec|list|search|git)$/.test(t))),
+    'nodes get DSH native tools plus the flow tools; ask_user_question and wf_start are masked')
   assert(reqs.every(r => !r.hiddenMetadata) && reqs.some(r => r.marker?.role === 'R'), 'node prompts carry no hidden metadata; the fake recognises nodes from ordinary content')
   const rPrompt = (await reqOf(r => r.marker?.title === 'A' && r.marker.role === 'R'))?.prompt ?? ''
   assert(rPrompt.startsWith('本节点：需求录入（R），第 1 版，执行 PH ph-require。流程模板：完整流程（full）') && rPrompt.includes('# requirement-template.md'), 'R runs ph-require with the bundled PH template')
@@ -157,7 +172,7 @@ async function scenarioA() {
   const tasksPath = `.rdfoe/runs/${s.run.id}/T/v1/tasks.md`
   const tDone = s.versions.find(v => v.node_key === 'T').created_at
   const vStart = s.agents.find(a => a.role === 'V').started_at
-  assert(tDone <= vStart && s.toolCalls.some(t => t.tool === 'wf_read' && t.args_digest.includes(tasksPath) && t.exit_code === 0), 'V ran after T and read tasks.md')
+  assert(tDone <= vStart && s.toolCalls.some(t => t.tool === 'read' && t.args_digest.includes(tasksPath) && t.exit_code === 0), 'V ran after T and read tasks.md')
   assert(h2.payload.subjects.map(x => x.node).join() === 'T,V' && h2.payload.rollbackTargets.join() === 'T,V', 'H2 (授权实施) reviews T and V; rollback to T or V')
   await respond(h2.id, { action: 'approve' })
 
@@ -167,11 +182,20 @@ async function scenarioA() {
     return snap.inbox.find(i => i.status === 'OPEN' && i.kind === 'review' && i.payload.gate === 'H3') ? snap : undefined
   })
   assert(s.loop.length === 2 && s.loop[0].failed === 1 && s.loop[1].failed === 0, 'loop record: round 1 failed 1 item, round 2 passed')
-  const execs = s.toolCalls.filter(t => t.tool === 'wf_exec')
-  assert(execs.some(t => t.args_digest.includes('npm') && t.exit_code === 1) && execs.some(t => t.args_digest.includes('npm') && t.exit_code === 0), 'wf_exec ran npm test (failing then passing), audited')
-  assert(execs.some(t => t.args_digest.includes('shell ok') && t.exit_code === 0), 'wf_exec runs shell pipelines without approval items')
-  assert(s.toolCalls.some(t => t.tool === 'wf_write' && t.args_digest.includes('src/add.js') && t.exit_code === -1 && s.agents.find(a => a.agent_session_id === t.agent_session_id)?.role === 'Y'),
-    'Y was refused a write to application code (scoped to verification.md + tasks.md)')
+  const execs = s.toolCalls.filter(t => t.tool === 'bash')
+  assert(execs.some(t => t.args_digest.includes('npm') && t.exit_code === 1) && execs.some(t => t.args_digest.includes('npm') && t.exit_code === 0), 'native bash ran npm test (failing then passing), audited')
+  assert(execs.some(t => t.args_digest.includes('shell ok') && t.exit_code === 0), 'native bash runs shell pipelines without approval items')
+  const probe = join(homedir(), '.rdfoe-e2e-sandbox-probe')
+  const escaped = existsSync(probe)
+  rmSync(probe, { force: true })
+  assert(!escaped && execs.some(t => t.args_digest.includes('sandbox-probe')), 'native bash runs in DSH\'s sandbox: it cannot write outside the worktree (probe in $HOME)')
+  const roleOf = t => s.agents.find(a => a.agent_session_id === t.agent_session_id)?.role
+  assert(s.toolCalls.some(t => t.tool === 'write' && t.args_digest.includes('src/add.js') && t.exit_code === -1 && roleOf(t) === 'Y'),
+    'Y was refused a native write to application code (scoped to verification.md + tasks.md)')
+  const yReports = s.toolCalls.filter(t => t.tool === 'wf_report' && roleOf(t) === 'Y')
+  const y1 = (await fakeRequests()).filter(r => r.marker?.title === 'A' && r.marker.role === 'Y' && r.marker.round === '1')
+  assert(y1.some(r => r.lastToolResult.includes('may not change: src/add.js')) && yReports.length >= 2,
+    'Y changed src/add.js through bash: wf_report refused it until the file was restored (git snapshot scope check)')
   assert(readFileSync(join(s.run.worktree_path, tasksPath), 'utf8').includes('T2 修复 F-1'), 'Y appended the fix task to tasks.md')
   const x2 = await reqOf(r => r.marker?.title === 'A' && r.marker.role === 'X' && r.marker.round === '2')
   assert(x2 && x2.marker.tasks === tasksPath && x2.prompt.includes('上一轮验证记录') && x2.prompt.includes('VP-1：npm test exit 1'), 'X round 2 got tasks.md, the previous verification record and the failed item')
@@ -290,7 +314,7 @@ async function scenarioN() {
   await respond(b.id, { action: 'answer', answers: { b: { selected: ['继续'] } } })
   await waitNode(sessionId, 'R', n => n.status === 'SUCCEEDED', 'R done')
   const reqs = await fakeRequests()
-  assert(reqs.some(r => r.marker?.title === 'N' && r.lastToolResult.includes('【用户的新回复】') && r.lastToolResult.includes('snake_case')), 'n) the non-blocking answer arrived with the next wf_* tool result')
+  assert(reqs.some(r => r.marker?.title === 'N' && (r.lastToolResult + r.lastUserText).includes('【用户的新回复】') && (r.lastToolResult + r.lastUserText).includes('snake_case')), 'n) the non-blocking answer reached the working agent (steered, or with a flow-tool result)')
   for (const gate of ['H1', 'H2', 'H3']) await approveGate(sessionId, gate)
   const s = await waitFor('run N COMPLETED', async () => { const snap = await runSnap(sessionId); return snap.run.status === 'COMPLETED' ? snap : undefined })
   assert(existsSync(join(dir, 'src/add.js')) && existsSync(join(dir, '.rdfoe/runs', s.run.id, 'D/v1/design.md')) && existsSync(join(dir, '.rdfoe/runs', s.run.id, 'A/v1/archive.md')), 'n) non-git run completed with files in the project directory')

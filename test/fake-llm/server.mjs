@@ -47,7 +47,9 @@ if (process.env.FAKE_LLM_SCENARIO) scenario = JSON.parse(readFileSync(process.en
 
 const report = (extra = {}) => ({ name: 'wf_report', input: { summary: '{node} v{v} done', artifacts: [], openIssues: [], confidence: 0.8, ...extra } })
 
-const write = (file, content) => ({ name: 'wf_write', input: { path: `{dir}/${file}`, content } })
+const write = (file, content) => ({ name: 'write', input: { file_path: `{dir}/${file}`, content } })
+
+const bash = (command) => ({ name: 'bash', input: { command, description: 'Run a command' } })
 
 /** Happy path for every node; scenarios override per node/version/round/title. File names follow PH (§17). */
 const DEFAULT_RULES = [
@@ -60,7 +62,7 @@ const DEFAULT_RULES = [
   ], say: 'design review done' },
   { match: { role: 'T' }, calls: [write('tasks.md', '# 任务清单\n\n- [ ] T1 实现 FR-1：新建 src/add.js 并补单测；完成判据：npm test 通过\n'), report()], say: 'tasks done' },
   { match: { role: 'V' }, calls: [
-    { name: 'wf_read', input: { path: '{tasks}' } },
+    { name: 'read', input: { file_path: '{tasks}' } },
     write('verify-plan.md', '# 验证计划\n\n- VP-1：验证 FR-1（T1）—— 运行 npm test；期望退出码 0。\n'),
     write('acceptance.md', '# 验收指引\n\n- AC-1：在工作流分支运行 npm test，看到 ok。\n'),
     report(),
@@ -73,13 +75,13 @@ const DEFAULT_RULES = [
     report(),
   ], say: 'small change prepared' },
   { match: { role: 'X' }, calls: [
-    { name: 'wf_write', input: { path: 'src/add.js', content: 'module.exports = (a, b) => a + b\n' } },
-    { name: 'wf_exec', input: { command: 'npm test' } },
+    { name: 'write', input: { file_path: 'src/add.js', content: 'module.exports = (a, b) => a + b\n' } },
+    bash('npm test'),
     write('verification.md', '# 实施证据 第 {round} 轮\n\n- T1：npm test exit 0\n'),
     report(),
   ], say: 'implementation done' },
   { match: { role: 'Y' }, calls: [
-    { name: 'wf_exec', input: { command: 'npm test' } },
+    bash('npm test'),
     write('verification.md', '# 验证记录 第 {round} 轮\n\n- VP-1：npm test exit 0，通过\n'),
     report({ verdict: 'pass', items: [{ id: 'VP-1', result: 'pass', evidence: 'npm test exit 0' }] }),
   ], say: 'verification done' },
@@ -268,6 +270,8 @@ const server = createServer(async (req, res) => {
     hiddenMetadata: JSON.stringify(body).includes('⟦rdfoe'),
     tools: (body.tools ?? []).map(t => t.name),
     lastToolResult: lastUser && Array.isArray(lastUser.content) ? lastUser.content.filter(b => b.type === 'tool_result').map(resultText).join('\n').slice(0, 2000) : '',
+    // Text the host added to the last user message (steered replies ride here).
+    lastUserText: lastUser ? textOf(lastUser.content).slice(0, 2000) : '',
     decision,
   })
   res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache' })

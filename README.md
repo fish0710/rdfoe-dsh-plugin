@@ -7,7 +7,7 @@ RDFOE 本地工作流插件，运行在 DeepSeek Harness（DSH）上，已在 `0
 小改动（--small）：S 小改动 → 【H2 授权实施】→ X 实施 ⇄ Y 验证 → 【H3 用户验收】→ A 归档
 ```
 
-- 节点由插件创建的子代理执行，只能使用插件工具（`wf_read/list/search/write/edit/exec/git/ask/message/report`），看不到 DSH 原生的 bash 与写文件工具。验证子代理（Y）只能写自己的 `verification.md` 和往 `tasks.md` 追加修复任务，设计审查（DR）和归档（A）只能写自己的 `review.md` / `archive.md`，写其他路径会被拒绝。
+- 节点由插件创建的子代理执行。子代理和 DSH 自己的子代理一样加入主会话的代理预设，使用 DSH 原生工具（read、write、edit、glob、grep、bash、网页、技能等），在 DSH 沙箱里执行：继承主会话的沙箱模式（默认 workspace-write，可写范围就是本工作流的 worktree），审批固定为「不询问」。插件只额外提供三个流程工具：`wf_ask`（经收件箱提问）、`wf_message`（发消息）、`wf_report`（提交结构化结果，推动状态机）。DSH 的 `ask_user_question` 和目标工具对节点屏蔽。插件在执行前检查原生调用：write/edit 只能写 worktree 内、不能写 `.git`；bash 不能 git 提交、重置、切分支或推送（提交由工作流负责）。验证子代理（Y）只能改自己的 `verification.md` 和往 `tasks.md` 追加修复任务，设计审查（DR）和归档（A）只能改自己的 `review.md` / `archive.md`：write/edit 写其他路径会被拒绝；git 仓库里用 bash 改了其他文件时，`wf_report` 会列出这些文件并拒绝，直到恢复原样。原生工具调用和流程工具一样记进审计，显示在节点详情的时间线上。
 - 【】里的三道审核只能由人拍板；AI 设计审查（DR）有阻断时只会让设计自动重做，不能代替设计批准。
 - 子代理的问题、消息，编排器的审核项、防空转询问，都进入**跨会话统一收件箱**（侧边栏「收件箱」），也可以在会话「工作流」视图的收件箱页签处理；支持键盘操作。
 - 右侧栏也有入口（0.1.0-beta.5 起）：顶部工具栏在「分栏 / 全屏 / 收起」左边多了「工作流」「收件箱」两个图标（收件箱带待处理数），「开始」页多了「工作流」「收件箱」两张卡片；点它们在右侧栏打开本会话的工作流（还没有工作流时是开启页）或收件箱，可以边聊边看。
@@ -113,7 +113,6 @@ npx -y @deepseek-ai/dsh@0.1.7-alpha.2 rdfoe --port 3090
       X:  { provider: deepseek-official, model: deepseek-flash }
       Y:  { provider: deepseek-official, model: deepseek-flash }
     loop: { stallRounds: 3, remindAt: 10 } # 防空转：设计连续 3 次被审查挡回、实施⇄验证连续 3 轮不收敛或累计 10 轮时暂停问你
-    exec: { timeoutMs: 600000 }            # wf_exec 超时
     # personas: { X: "……" }                # 覆盖某个节点的系统提示词（默认见 src/host/prompts/personas.ts）
 ```
 
@@ -126,7 +125,7 @@ provider/model 的写法与会话里模型选择器中的一致（`~/.dsh/settin
 - 改了插件代码：`pnpm build` 后重启 DSH（浏览器端会自动热更新，Host 端不会）。
 - 停用/卸载：`npx -y @deepseek-ai/dsh@0.1.7-alpha.2 plugin --profile rdfoe remove @rdfoe/dsh-workflow`；工作流数据在 `~/.dsh/rdfoe-workflow/`，worktree 可用 `git worktree remove` 清理。
 
-**注意**：子代理的 `wf_exec` 在 DSH 沙箱之外、以你的用户身份执行任意 shell 命令（首版为了体验放开了限制），请只在你信任的仓库和需求上使用。
+**注意**：子代理的 bash 在 DSH 沙箱里执行，审批固定为「不询问」，需要审批的操作（例如沙箱外写入、按 DSH 设置需要审批的联网）会被自动拒绝，子代理会把限制写进 openIssues。需要放宽时，在主会话里切换权限模式（例如「完全访问」）后再开启工作流：节点继承主会话当时的沙箱模式。旧配置项 `exec`、`write` 已不再生效。
 
 ## 开发
 
@@ -195,7 +194,10 @@ docs/                 M0-notes.md、screenshots/
 
 ## 已知限制
 
-- 节点工具在 DSH 沙箱之外执行：`wf_exec` 可以跑任意 shell 命令（可联网），文件工具只限制在 worktree 内。
+- 节点继承开启节点时主会话的沙箱模式；主会话不在线时（例如 DSH 重启后续跑）节点作为根代理挂载默认预设，用部署默认的沙箱模式（`DSH_PERMISSION_MODE`，默认 workspace-write）。
+- DSH 沙箱允许写系统临时目录，所以 worktree 放在临时目录下时，bash 也能写 worktree 之外的临时文件。
+- Y、DR、A 的写入范围在 git 仓库里靠快照对比兜底，非 git 目录只拦 write/edit，bash 的写入不检查。
+- 用户对非阻塞提问和消息的回复，通过 DSH 的 steering 在子代理的下一步送达；子代理已经结束时，在该节点下次运行的提示词里送达。
 - DSH 把「还没有过对话回合（`turn/start`）」的会话当作空白的「新会话」：左侧列表只显示当前选中的那一个空白会话，也不显示「对话 / 轨迹 / 工作流」标签。0.1.0-beta.4 及以前 `/rdfoe-workflow` 不经过模型、直接开启工作流，而斜杠命令只记 `command/run`/`command/done`、不算回合，这样开启的会话一切到别的会话就从列表消失。0.1.0-beta.5 起命令改为发一条真实的用户消息、由模型调用 `wf_start`（见「怎么开启工作流」）。工作流视图里的「开启工作流」按钮仍不经过模型：开启后插件用 `sessionTitle.rename` 把会话标题设为「工作流 · <需求摘要>」（已有标题时不改），再用 `agent.followup` 投一条占位消息唤起一轮、在 `agent/pre-step` 里清掉它，这一轮在任何请求前以 `completed` 结束，只写 DSH 自己的事件；代价是「对话」里多一行「用时 1 秒」的空回合。
 - DSH 在一轮结束后会把工具调用折进「用时 …」里，`wf_start` 的工具卡片也在其中；回复下面那张常显的卡片挂在 `conversation.chat.turnTail`（0.1.7 是列表席位，0.1.5 是选择链席位，同一轮里如果还有 DSH 的交付文件卡片，0.1.5 只显示先匹配的一张），由插件登记的会话事件定义（只读取 `turn/start` 与 `wf_start` 的 `tool/call`）判断哪一轮开启了工作流。
 - 旧版本留下、被隐藏的会话：在收件箱点「打开会话」，或在右侧栏「工作流」标签（当前会话没有工作流时）底部的「本机的工作流」列表里点「打开会话」，插件会补上标题和第一轮，这个会话此后回到左侧列表。

@@ -32,24 +32,50 @@ const parse = (v: VersionRow | undefined): Structured => (v ? JSON.parse(v.struc
 
 // ── activity timeline ───────────────────────────────────────────────────────
 
+const ICON = {
+  read: 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z M12 9a3 3 0 100 6 3 3 0 000-6',
+  list: 'M3 7h7l2 2h9v10H3z',
+  search: 'M11 4a7 7 0 100 14 7 7 0 000-14 M21 21l-5-5',
+  write: 'M5 19l4-1 9-9-3-3-9 9z',
+  edit: 'M4 20h4L19 9l-4-4L4 16z',
+  exec: 'M4 17l6-5-6-5 M12 19h8',
+  git: 'M6 3v12 M18 9a3 3 0 100-6 3 3 0 000 6z M6 21a3 3 0 100-6 3 3 0 000 6z M18 9a9 9 0 01-9 9',
+  web: 'M12 3a9 9 0 100 18 9 9 0 000-18 M3 12h18 M12 3c3 3 3 15 0 18 M12 3c-3 3-3 15 0 18',
+}
+
 const TOOL_META: Record<string, { label: string, icon: string }> = {
-  wf_read: { label: '读取', icon: 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z M12 9a3 3 0 100 6 3 3 0 000-6' },
-  wf_list: { label: '列目录', icon: 'M3 7h7l2 2h9v10H3z' },
-  wf_search: { label: '搜索', icon: 'M11 4a7 7 0 100 14 7 7 0 000-14 M21 21l-5-5' },
-  wf_write: { label: '写入', icon: 'M5 19l4-1 9-9-3-3-9 9z' },
-  wf_edit: { label: '修改', icon: 'M4 20h4L19 9l-4-4L4 16z' },
-  wf_exec: { label: '执行', icon: 'M4 17l6-5-6-5 M12 19h8' },
-  wf_git: { label: 'Git', icon: 'M6 3v12 M18 9a3 3 0 100-6 3 3 0 000 6z M6 21a3 3 0 100-6 3 3 0 000 6z M18 9a9 9 0 01-9 9' },
+  // DSH native tools (0.1.0-beta.6 on).
+  read: { label: '读取', icon: ICON.read },
+  read_image: { label: '看图', icon: ICON.read },
+  glob: { label: '找文件', icon: ICON.list },
+  grep: { label: '搜索', icon: ICON.search },
+  write: { label: '写入', icon: ICON.write },
+  edit: { label: '修改', icon: ICON.edit },
+  bash: { label: '执行', icon: ICON.exec },
+  web_fetch: { label: '抓取网页', icon: ICON.web },
+  web_search: { label: '网页搜索', icon: ICON.web },
+  // Flow tools.
   wf_ask: { label: '提问', icon: 'M9.1 9a3 3 0 015.8 1c0 2-3 3-3 3 M12 17h.01' },
   wf_message: { label: '消息', icon: 'M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z' },
   wf_report: { label: '提交结果', icon: 'M5 12l4 4 10-10' },
+  // Plugin file/shell tools of runs before 0.1.0-beta.6.
+  wf_read: { label: '读取', icon: ICON.read },
+  wf_list: { label: '列目录', icon: ICON.list },
+  wf_search: { label: '搜索', icon: ICON.search },
+  wf_write: { label: '写入', icon: ICON.write },
+  wf_edit: { label: '修改', icon: ICON.edit },
+  wf_exec: { label: '执行', icon: ICON.exec },
+  wf_git: { label: 'Git', icon: ICON.git },
 }
 
+/** Shell calls: the audit row holds the command line itself. */
+const isShell = (tool: string) => tool === 'bash' || tool === 'wf_exec'
+
 function callText(c: ToolCallRow): string {
-  if (c.tool === 'wf_exec') return c.args_digest
+  if (isShell(c.tool)) return c.args_digest
   try {
     const args = JSON.parse(c.args_digest) as Record<string, unknown>
-    return String(args.path ?? args.pattern ?? args.action ?? args.question ?? args.text ?? args.summary ?? '')
+    return String(args.file_path ?? args.path ?? args.pattern ?? args.url ?? args.query ?? args.action ?? args.question ?? args.text ?? args.summary ?? '')
   } catch {
     return c.args_digest
   }
@@ -70,13 +96,13 @@ function Timeline({ calls, live }: { calls: ToolCallRow[], live: boolean }) {
             <span className="rwf-tl-body">
               <span className="rwf-tl-head">
                 <b>{meta.label}</b>
-                {c.tool === 'wf_exec'
+                {isShell(c.tool)
                   ? <code className="rwf-tl-cmd">{text}</code>
                   : <span className="rwf-tl-text">{text}</span>}
               </span>
               <span className="rwf-tl-meta">
-                {c.tool === 'wf_exec' && c.exit_code !== null && <span className={failed ? 'rwf-err-text' : 'rwf-ok-text'}>退出码 {c.exit_code}</span>}
-                {c.tool !== 'wf_exec' && failed && <span className="rwf-err-text">出错</span>}
+                {isShell(c.tool) && c.exit_code !== null && <span className={failed ? 'rwf-err-text' : 'rwf-ok-text'}>退出码 {c.exit_code}</span>}
+                {!isShell(c.tool) && failed && <span className="rwf-err-text">出错</span>}
                 <span>{c.duration_ms < 1000 ? `${c.duration_ms}ms` : `${(c.duration_ms / 1000).toFixed(1)}s`}</span>
                 <span>{c.ts.slice(11, 19)}</span>
               </span>

@@ -266,8 +266,9 @@ export const CSS = `
 .rwf-timeline { list-style: none; margin: 0; padding: 0 0 0 4px; border-left: 1px solid var(--rwf-border); margin-left: 10px; }
 .rwf-tl-item { display: flex; gap: 10px; padding: 6px 0 6px 0; position: relative; }
 .rwf-tl-icon { width: 22px; height: 22px; border-radius: 50%; background: var(--rwf-layer); border: 1px solid var(--rwf-border); display: inline-flex; align-items: center; justify-content: center; color: var(--rwf-sub); flex: none; margin-left: -16px; }
+.rwf-tl-item[data-tool="write"] .rwf-tl-icon, .rwf-tl-item[data-tool="edit"] .rwf-tl-icon,
 .rwf-tl-item[data-tool="wf_write"] .rwf-tl-icon, .rwf-tl-item[data-tool="wf_edit"] .rwf-tl-icon { color: var(--rwf-run); }
-.rwf-tl-item[data-tool="wf_exec"] .rwf-tl-icon { color: var(--rwf-fg); }
+.rwf-tl-item[data-tool="bash"] .rwf-tl-icon, .rwf-tl-item[data-tool="wf_exec"] .rwf-tl-icon { color: var(--rwf-fg); }
 .rwf-tl-item[data-tool="wf_ask"] .rwf-tl-icon, .rwf-tl-item[data-tool="wf_message"] .rwf-tl-icon { color: var(--rwf-warn); }
 .rwf-tl-item[data-tool="wf_report"] .rwf-tl-icon { color: var(--rwf-ok); }
 .rwf-tl-item.failed .rwf-tl-icon { color: var(--rwf-err); border-color: color-mix(in srgb, var(--rwf-err) 40%, transparent); }

@@ -1,17 +1,19 @@
 /**
- * Controlled tools mounted only inside node subagents (§6.3). They are
- * registered through the node agent's scoped context, so the main session
- * never sees them. Every call is audited in `tool_call`, and every result
- * carries pending non-blocking user replies (§7.4 rule 1).
+ * Workflow tools of node subagents (§6.3). A node agent joins DSH's own agent
+ * preset (read, write, edit, glob, grep, bash, web, skills, …) and gets only
+ * the flow tools here on top: wf_ask / wf_message (the inbox) and wf_report
+ * (the structured result that drives the state machine). They are registered
+ * through the node agent's scoped context, so the main session never sees
+ * them. The native calls pass `guardNativeCall` first; every call, native or
+ * not, is audited in `tool_call`; flow-tool results also carry pending
+ * non-blocking user replies (§7.4 rule 1), which otherwise arrive as steering.
  */
-import { exec as execShell } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { readdir, readFile, stat } from 'node:fs/promises'
+import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { git } from '../git/git.ts'
 import { CHECK_ROLES, type Role } from '../workflow/template.ts'
-import { relPosix, resolveInside, safeEditFile, safeWriteFile } from './path-guard.ts'
+import { relPosix, resolveInside } from './path-guard.ts'
 
 export interface AskQuestion {
   id?: string
@@ -44,8 +46,10 @@ export interface ToolEnv {
   root: string
   /** Workspace-relative files that must exist before wf_report is accepted. */
   required?: string[]
-  /** When set, wf_write / wf_edit may touch only these workspace-relative files (Y, DR, A). */
+  /** When set, the node may change only these workspace-relative files (Y, DR, A). */
   writeScope?: string[]
+  /** Scoped roles in git runs: workspace paths changed since the agent started that lie outside writeScope. */
+  outOfScope?(): Promise<string[]>
   agentSessionId(): string | undefined
   audit(tool: string, args: unknown, affected: string[], exitCode: number | null, startedAt: number): void
   /** Pending non-blocking replies for this agent, marked delivered. */
@@ -53,7 +57,6 @@ export interface ToolEnv {
   ask(questions: AskQuestion[], blocking: boolean, signal: AbortSignal): Promise<string>
   message(text: string, level: string, expectReply: boolean): Promise<string>
   report(report: NodeReport): void
-  limits: { maxWriteBytes: number, execTimeoutMs: number, execOutputBytes: number }
 }
 
 const withReplies = (env: ToolEnv) => {
@@ -86,264 +89,54 @@ async function audited<T>(env: ToolEnv, tool: string, args: unknown, fn: () => P
   }
 }
 
-// ── read-side tools (all roles) ─────────────────────────────────────────────
-
-export function wfRead(env: ToolEnv) {
-  return defineTool({
-    name: 'wf_read',
-    description: 'Read a UTF-8 text file in the workflow workspace. Paths are relative to the workspace root.',
-    parameters: {
-      path: { type: 'string', required: true, description: 'File path relative to the workspace root' },
-      offset: { type: 'integer', description: '1-based first line (optional)' },
-      limit: { type: 'integer', description: 'Maximum number of lines (optional)' },
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: false, properties: { content: { type: 'string', required: true }, userReplies: repliesSchema } },
-      render: (_a, v) => [{ type: 'text', text: v.content }, ...renderReplies(v)],
-    },
-    async execute(args, exec) {
-      return audited(env, 'wf_read', args, async () => {
-        const target = await resolveInside(env.root, args.path, 'read')
-        let content = await readFile(target, { encoding: 'utf8', signal: exec.signal })
-        if (args.offset !== undefined || args.limit !== undefined) {
-          const lines = content.split('\n')
-          const start = Math.max(1, args.offset ?? 1)
-          content = lines.slice(start - 1, args.limit === undefined ? undefined : start - 1 + args.limit).join('\n')
-        }
-        return { value: { content, ...withReplies(env) }, affected: [relPosix(env.root, target)] }
-      })
-    },
-  })
-}
-
-const LIST_LIMIT = 500
-
-export function wfList(env: ToolEnv) {
-  return defineTool({
-    name: 'wf_list',
-    description: 'List a directory in the workflow workspace (directories end with "/"). Set recursive to walk subdirectories (skips .git and node_modules).',
-    parameters: {
-      path: { type: 'string', description: 'Directory relative to the workspace root (default ".")' },
-      recursive: { type: 'boolean', description: 'Walk subdirectories' },
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: false, properties: { entries: { type: 'array', required: true, items: { type: 'string' } }, truncated: { type: 'boolean', required: true }, userReplies: repliesSchema } },
-      render: (_a, v) => [{ type: 'text', text: v.entries.join('\n') + (v.truncated ? '\n…(truncated)' : '') }, ...renderReplies(v)],
-    },
-    async execute(args) {
-      return audited(env, 'wf_list', args, async () => {
-        const base = await resolveInside(env.root, args.path ?? '.', 'read')
-        const entries: string[] = []
-        const walk = async (dir: string): Promise<void> => {
-          for (const entry of await readdir(dir, { withFileTypes: true })) {
-            if (entries.length >= LIST_LIMIT) return
-            if (entry.name === '.git' || entry.name === 'node_modules') continue
-            const abs = join(dir, entry.name)
-            const rel = relPosix(env.root, abs)
-            if (entry.isDirectory()) {
-              entries.push(`${rel}/`)
-              if (args.recursive) await walk(abs)
-            } else {
-              entries.push(rel)
-            }
-          }
-        }
-        await walk(base)
-        return { value: { entries, truncated: entries.length >= LIST_LIMIT, ...withReplies(env) } }
-      })
-    },
-  })
-}
-
-export function wfSearch(env: ToolEnv) {
-  return defineTool({
-    name: 'wf_search',
-    description: 'Search file contents in the workflow workspace with a JavaScript regular expression. Returns up to 200 "path:line: text" matches.',
-    parameters: {
-      pattern: { type: 'string', required: true, description: 'Regular expression' },
-      path: { type: 'string', description: 'Directory to search (default ".")' },
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: false, properties: { matches: { type: 'array', required: true, items: { type: 'string' } }, userReplies: repliesSchema } },
-      render: (_a, v) => [{ type: 'text', text: v.matches.length ? v.matches.join('\n') : '(no matches)' }, ...renderReplies(v)],
-    },
-    async execute(args) {
-      return audited(env, 'wf_search', args, async () => {
-        const regex = new RegExp(args.pattern)
-        const base = await resolveInside(env.root, args.path ?? '.', 'read')
-        const matches: string[] = []
-        const walk = async (dir: string): Promise<void> => {
-          for (const entry of await readdir(dir, { withFileTypes: true })) {
-            if (matches.length >= 200) return
-            if (entry.name === '.git' || entry.name === 'node_modules') continue
-            const abs = join(dir, entry.name)
-            if (entry.isDirectory()) { await walk(abs); continue }
-            if (!entry.isFile() || (await stat(abs)).size > 1024 * 1024) continue
-            const lines = (await readFile(abs, 'utf8')).split('\n')
-            lines.forEach((line, i) => { if (matches.length < 200 && regex.test(line)) matches.push(`${relPosix(env.root, abs)}:${i + 1}: ${line.slice(0, 300)}`) })
-          }
-        }
-        await walk(base)
-        return { value: { matches, ...withReplies(env) } }
-      })
-    },
-  })
-}
-
-// ── write-side tools ────────────────────────────────────────────────────────
+// ── native tools: guard and audit ─────────────────────────────────────────────
 
 /**
- * Writes stay inside the run workspace and out of .git. Roles are constrained
- * by their tool set and persona; a role with a write scope (Y, DR, A) is
- * also refused any path outside it.
+ * DSH tools a node never gets: questions go through wf_ask (the inbox), and
+ * goals and plan mode would take the turn away from the workflow.
  */
-async function approveWrite(env: ToolEnv, path: string): Promise<string> {
-  const target = await resolveInside(env.root, path, 'write')
-  if (env.writeScope && !env.writeScope.includes(relPosix(env.root, target))) {
-    throw new Error(`${relPosix(env.root, target)} is outside what this node may write: ${env.writeScope.join(', ')}`)
+export const NATIVE_DENY = ['ask_user_question', 'create_goal', 'update_goal', 'get_goal', 'exit_plan_mode'] as const
+
+/** Native file tools whose `file_path` the guard checks. */
+const FILE_WRITERS = new Set(['write', 'edit'])
+
+/** Git commands that rewrite the run branch; the workflow owns commits (restore/checkout of files stays allowed). */
+const GIT_OWNED = /(^|[;&|(\s])git\s+(?:-\S+(?:\s+[^-\s]\S*)?\s+)*(commit|push|merge|rebase|reset|switch|tag|cherry-pick|revert|am|worktree)\b/
+
+/**
+ * Pre-dispatch check for one native tool call of a node agent. DSH's sandbox
+ * and the worktree cwd bound the agent as a whole; this adds the node's own
+ * limits: writes stay inside the workspace and out of .git, a scoped role
+ * (Y, DR, A) writes only its files, and nobody commits or moves the branch.
+ * @returns the denial reason, or undefined to let the call run.
+ */
+export async function guardNativeCall(env: Pick<ToolEnv, 'root' | 'writeScope'>, name: string, args: unknown): Promise<string | undefined> {
+  const input = (args ?? {}) as Record<string, unknown>
+  if (FILE_WRITERS.has(name) && typeof input.file_path === 'string') {
+    let rel: string
+    try {
+      rel = relPosix(env.root, await resolveInside(env.root, input.file_path, 'write'))
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error)
+    }
+    if (env.writeScope && !env.writeScope.includes(rel)) return `${rel} is outside what this node may write: ${env.writeScope.join(', ')}`
   }
-  return target
+  if (name === 'bash' && typeof input.command === 'string' && GIT_OWNED.test(input.command)) {
+    return 'the workflow owns commits and the run branch; do not commit, reset, switch or push. Leave your changes in the working tree.'
+  }
+  return undefined
 }
 
-export function wfWrite(env: ToolEnv) {
-  return defineTool({
-    name: 'wf_write',
-    description: 'Create or overwrite a UTF-8 text file in the workflow workspace. Paths are relative to the workspace root; your role limits which paths you may write.',
-    parameters: {
-      path: { type: 'string', required: true, description: 'File path relative to the workspace root' },
-      content: { type: 'string', required: true, description: 'Full file content' },
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: false, properties: { path: { type: 'string', required: true }, bytes: { type: 'integer', required: true }, userReplies: repliesSchema } },
-      render: (_a, v) => [{ type: 'text', text: `wrote ${v.bytes} bytes to ${v.path}` }, ...renderReplies(v)],
-    },
-    async execute(args) {
-      return audited(env, 'wf_write', { path: args.path, bytes: args.content.length }, async () => {
-        const bytes = Buffer.byteLength(args.content, 'utf8')
-        if (bytes > env.limits.maxWriteBytes) throw new Error(`content exceeds ${env.limits.maxWriteBytes} bytes`)
-        const target = await approveWrite(env, args.path)
-        await safeWriteFile(env.root, target, args.content)
-        const rel = relPosix(env.root, target)
-        return { value: { path: rel, bytes, ...withReplies(env) }, affected: [rel] }
-      })
-    },
-  })
-}
-
-export function wfEdit(env: ToolEnv) {
-  return defineTool({
-    name: 'wf_edit',
-    description: 'Replace exact text in an existing file. old_text must occur exactly once unless replace_all is true.',
-    parameters: {
-      path: { type: 'string', required: true, description: 'File path relative to the workspace root' },
-      old_text: { type: 'string', required: true, description: 'Exact text to replace' },
-      new_text: { type: 'string', required: true, description: 'Replacement text' },
-      replace_all: { type: 'boolean', description: 'Replace every occurrence' },
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: false, properties: { path: { type: 'string', required: true }, replacements: { type: 'integer', required: true }, userReplies: repliesSchema } },
-      render: (_a, v) => [{ type: 'text', text: `edited ${v.path} (${v.replacements} replacement(s))` }, ...renderReplies(v)],
-    },
-    async execute(args) {
-      return audited(env, 'wf_edit', { path: args.path }, async () => {
-        const target = await approveWrite(env, args.path)
-        let count = 0
-        await safeEditFile(env.root, target, (current) => {
-          count = current.split(args.old_text).length - 1
-          if (count === 0) throw new Error('old_text not found')
-          if (count > 1 && !args.replace_all) throw new Error(`old_text occurs ${count} times; pass replace_all or add context`)
-          const updated = current.split(args.old_text).join(args.new_text)
-          if (Buffer.byteLength(updated, 'utf8') > env.limits.maxWriteBytes) throw new Error(`result exceeds ${env.limits.maxWriteBytes} bytes`)
-          return updated
-        })
-        const rel = relPosix(env.root, target)
-        return { value: { path: rel, replacements: args.replace_all ? count : 1, ...withReplies(env) }, affected: [rel] }
-      })
-    },
-  })
-}
-
-// ── execution ──────────────────────────────────────────────────────────────
-
-function truncate(text: string, max: number): string {
-  if (text.length <= max) return text
-  return `…(${text.length - max} bytes truncated)…\n${text.slice(-max)}`
-}
-
-export function wfExec(env: ToolEnv) {
-  return defineTool({
-    name: 'wf_exec',
-    description: 'Run a shell command in the workflow workspace (cwd is the workspace root), e.g. "npm test" or "go test ./... 2>&1 | tail -50". Use it for builds, tests, linters, inspection and dependency installs. Long-running servers are not supported: the command must finish (default timeout 10 minutes). Output is truncated to the tail.',
-    parameters: {
-      command: { type: 'string', required: true, description: 'Shell command line' },
-      reason: { type: 'string', description: 'Why you run it (shown in the workflow view)' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          exitCode: { type: 'integer', required: true },
-          stdout: { type: 'string', required: true },
-          stderr: { type: 'string', required: true },
-          timedOut: { type: 'boolean', required: true },
-          durationMs: { type: 'integer', required: true },
-          userReplies: repliesSchema,
-        },
-      },
-      render: (a, v) => [{ type: 'text', text: `$ ${a.command}\nexit ${v.exitCode}${v.timedOut ? ' (timed out)' : ''} · ${v.durationMs}ms\n--- stdout ---\n${v.stdout}\n--- stderr ---\n${v.stderr}` }, ...renderReplies(v)],
-    },
-    async execute(args, exec) {
-      const started = Date.now()
-      const result = await new Promise<{ exitCode: number, stdout: string, stderr: string, timedOut: boolean }>((resolve) => {
-        execShell(args.command, {
-          cwd: env.root,
-          timeout: env.limits.execTimeoutMs,
-          maxBuffer: 64 * 1024 * 1024,
-          signal: exec.signal,
-          env: { ...process.env, CI: '1', RDFOE_WORKFLOW: env.runId },
-        }, (error, stdout, stderr) => {
-          const err = error as (NodeJS.ErrnoException & { killed?: boolean, signal?: string }) | null
-          const code = err ? (typeof err.code === 'number' ? err.code : 1) : 0
-          resolve({ exitCode: code, stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), timedOut: Boolean(err?.killed && err.signal === 'SIGTERM') })
-        })
-      })
-      env.audit('wf_exec', args.command, [], result.exitCode, started)
-      return {
-        exitCode: result.exitCode,
-        stdout: truncate(result.stdout, env.limits.execOutputBytes),
-        stderr: truncate(result.stderr, env.limits.execOutputBytes),
-        timedOut: result.timedOut,
-        durationMs: Date.now() - started,
-        ...withReplies(env),
-      }
-    },
-  })
-}
-
-export function wfGit(env: ToolEnv) {
-  return defineTool({
-    name: 'wf_git',
-    description: 'Read-only git inspection of the workflow branch: status, diff (working tree or against the run base), or log. You cannot commit; the workflow commits for you.',
-    parameters: {
-      action: { type: 'string', enum: ['status', 'diff', 'log'], required: true, description: 'status | diff | log' },
-      path: { type: 'string', description: 'Limit diff to a path' },
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: false, properties: { output: { type: 'string', required: true }, userReplies: repliesSchema } },
-      render: (_a, v) => [{ type: 'text', text: v.output || '(empty)' }, ...renderReplies(v)],
-    },
-    async execute(args, exec) {
-      return audited(env, 'wf_git', args, async () => {
-        const pathArgs = args.path ? ['--', relPosix(env.root, await resolveInside(env.root, args.path, 'read'))] : []
-        const argv = args.action === 'status' ? ['status', '--short']
-          : args.action === 'log' ? ['log', '--oneline', '-n', '30']
-            : ['diff', 'HEAD', ...pathArgs]
-        const r = await git(env.root, argv, { signal: exec.signal })
-        return { value: { output: truncate(r.code === 0 ? r.stdout : r.stderr, env.limits.execOutputBytes), ...withReplies(env) }, exitCode: r.code }
-      })
-    },
-  })
+/** Audit row fields for a finished native call. */
+export function nativeAudit(name: string, args: unknown, result: { isError: boolean, value?: unknown }): { digest: string, affected: string[], exitCode: number | null } {
+  const input = (args ?? {}) as Record<string, unknown>
+  const affected = typeof input.file_path === 'string' ? [input.file_path] : []
+  if (name === 'bash') {
+    const value = (result.value ?? {}) as { exitCode?: number | null }
+    return { digest: String(input.command ?? ''), affected, exitCode: result.isError ? -1 : typeof value.exitCode === 'number' ? value.exitCode : null }
+  }
+  const shown = name === 'write' ? { file_path: input.file_path, bytes: typeof input.content === 'string' ? input.content.length : undefined } : input
+  return { digest: digest(shown), affected, exitCode: result.isError ? -1 : 0 }
 }
 
 // ── human channel ───────────────────────────────────────────────────────────
@@ -351,7 +144,7 @@ export function wfGit(env: ToolEnv) {
 export function wfAsk(env: ToolEnv) {
   return defineTool({
     name: 'wf_ask',
-    description: 'Ask the user one or more questions through the workflow inbox. Only ask when a real ambiguity would change the result. By default the call blocks until the user answers; with blocking=false you continue on your own assumption and the answer arrives later with another wf_* tool result.',
+    description: 'Ask the user one or more questions through the workflow inbox. Only ask when a real ambiguity would change the result. By default the call blocks until the user answers; with blocking=false you continue on your own assumption and the answer arrives later as a user message. Use this instead of any other way of asking the user.',
     parameters: {
       questions: {
         type: 'array',
@@ -388,7 +181,7 @@ export function wfAsk(env: ToolEnv) {
 export function wfMessage(env: ToolEnv) {
   return defineTool({
     name: 'wf_message',
-    description: 'Send the user a non-blocking message (progress, risk, or a decision they should know about). Set expectReply when you want an answer; it will arrive with a later wf_* tool result. Do not use this for questions that block your work (use wf_ask).',
+    description: 'Send the user a non-blocking message (progress, risk, or a decision they should know about). Set expectReply when you want an answer; it will arrive later as a user message. Do not use this for questions that block your work (use wf_ask).',
     parameters: {
       text: { type: 'string', required: true },
       level: { type: 'string', enum: ['info', 'risk', 'decision'], description: 'info | risk | decision' },
@@ -456,6 +249,8 @@ export function wfReport(env: ToolEnv) {
         if (!anyFail && args.verdict === 'fail') throw new Error('verdict "fail" requires at least one failing item')
       }
       if (isClarify && args.blocked && args.openIssues.length === 0) throw new Error('blocked=true needs the blocking decisions in openIssues')
+      const outside = (await env.outOfScope?.()) ?? []
+      if (outside.length > 0) throw new Error(`you changed files this node may not change: ${outside.join(', ')}. Restore them (for example git restore -- <path>, or delete a file you created) and report again; you may change only ${env.writeScope?.join(', ')}`)
       env.report(args)
       env.audit('wf_report', digest({ summary: args.summary.slice(0, 80), verdict: args.verdict, blocked: args.blocked }), args.artifacts, 0, Date.now())
       return { accepted: true, ...withReplies(env) }
@@ -463,26 +258,14 @@ export function wfReport(env: ToolEnv) {
   })
 }
 
-/** The tool set per role (§6.3 table, §17). Scoped roles (DR, Y, A) also carry a writeScope. */
+/** The flow tools per role; the native ones come from DSH's agent preset. DR and A do not talk to the user. */
 export function toolsFor(env: ToolEnv) {
-  const read = [wfRead(env), wfList(env), wfSearch(env)]
-  const human = [wfAsk(env), wfMessage(env), wfReport(env)]
   switch (env.role) {
-    case 'R':
-    case 'C':
-    case 'D':
-    case 'T':
-    case 'V':
-    case 'S':
-      return [...read, wfWrite(env), wfEdit(env), ...human]
-    case 'X':
-      return [...read, wfWrite(env), wfEdit(env), wfExec(env), wfGit(env), ...human]
-    case 'Y':
-      // Writes are scoped to its verification.md and the tasks.md it appends fix tasks to.
-      return [...read, wfWrite(env), wfEdit(env), wfExec(env), wfGit(env), ...human]
     case 'DR':
-      return [...read, wfWrite(env), wfReport(env)]
+      return [wfReport(env)]
     case 'A':
-      return [...read, wfWrite(env), wfGit(env), wfMessage(env), wfReport(env)]
+      return [wfMessage(env), wfReport(env)]
+    default:
+      return [wfAsk(env), wfMessage(env), wfReport(env)]
   }
 }

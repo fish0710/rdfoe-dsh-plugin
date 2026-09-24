@@ -17,7 +17,7 @@ import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { routeFor, type Config } from '../config.ts'
-import { commitAll, createWorktree, repoRoot } from '../git/git.ts'
+import { changedPaths, commitAll, createWorktree, repoRoot, snapshotTree } from '../git/git.ts'
 import type { InboxBroker } from '../inbox/broker.ts'
 import { personaFor } from '../prompts/personas.ts'
 import type { Hub } from '../runner/hub.ts'
@@ -52,6 +52,8 @@ export class WorkflowService {
   /** node_agent id → live agent session id. */
   private readonly agentSessions = new Map<string, string>()
   private readonly messageCounts = new Map<string, number>()
+  /** node_agent id → worktree snapshot taken when a scoped agent (Y, DR, A) started, for its scope check. */
+  private readonly baselines = new Map<string, string>()
   private readonly chains = new Map<string, Promise<void>>()
   /** Non-git projects: project path → run holding the implementation lock. */
   private readonly projectLocks = new Map<string, string>()
@@ -262,11 +264,17 @@ export class WorkflowService {
     const role = node.node_key as AiKey
     const outputs = REQUIRED_ARTIFACTS[role].map(file => `${artifactDir(run.id, role, version)}/${file}`)
     const tasksPath = role === 'X' || role === 'Y' ? this.planFile(run, 'tasks.md') : undefined
-    const env = this.toolEnv(run, node, agentRow, role, version, round, {
-      required: outputs,
-      // Y never touches application code; DR and A write only their own record.
-      writeScope: role === 'Y' ? [...outputs, ...(tasksPath ? [tasksPath] : [])] : role === 'DR' || role === 'A' ? outputs : undefined,
-    })
+    // Y never touches application code; DR and A write only their own record.
+    const writeScope = role === 'Y' ? [...outputs, ...(tasksPath ? [tasksPath] : [])] : role === 'DR' || role === 'A' ? outputs : undefined
+    // bash can write anywhere the sandbox allows: in git runs wf_report compares the tree against this snapshot.
+    if (writeScope && run.is_git && !this.baselines.has(agentRow.id)) {
+      const tree = await snapshotTree(run.worktree_path).catch((error: unknown) => {
+        this.store.event(run.id, node.id, 'scope:snapshot-failed', null, null, { error: String(error) })
+        return undefined
+      })
+      if (tree) this.baselines.set(agentRow.id, tree)
+    }
+    const env = this.toolEnv(run, node, agentRow, role, version, round, { required: outputs, writeScope })
     const prompt = buildPrompt({
       run, role, version, round, resume, outputs, tasksPath,
       upstream: this.upstreamFor(run, role, version),
@@ -421,8 +429,13 @@ export class WorkflowService {
       root: run.worktree_path,
       required: files.required,
       writeScope: files.writeScope,
+      outOfScope: files.writeScope && this.baselines.has(agentRow.id)
+        ? async () => {
+          const changed = await changedPaths(run.worktree_path, this.baselines.get(agentRow.id)!, await snapshotTree(run.worktree_path))
+          return changed.filter(path => !files.writeScope!.includes(path))
+        }
+        : undefined,
       agentSessionId,
-      limits: { maxWriteBytes: this.config.write.maxBytes, execTimeoutMs: this.config.exec.timeoutMs, execOutputBytes: this.config.exec.outputBytes },
       audit: (tool, args, affected, exitCode, startedAt) => {
         this.store.toolCall({ run_id: run.id, node_id: node.id, agent_session_id: agentSessionId() ?? null, tool, args_digest: typeof args === 'string' ? args : JSON.stringify(args), affected_paths: affected.length ? affected.join('\n') : null, exit_code: exitCode, duration_ms: Date.now() - startedAt })
         this.hub.publish({ type: 'tool', runId: run.id, nodeId: node.id, tool })
@@ -443,7 +456,7 @@ export class WorkflowService {
       },
       ask: async (questions, blocking, signal) => {
         const item = this.inbox.open({ runId: run.id, sessionId: run.session_id, nodeId: node.id, agentSessionId: agentSessionId() ?? null, round, kind: 'question', blocking, payload: { role, questions } })
-        if (!blocking) return `问题已登记为 ${item.id}（非阻塞）。请按你的合理假设继续；用户答复后会随之后的 wf_* 工具结果送达。`
+        if (!blocking) return `问题已登记为 ${item.id}（非阻塞）。请按你的合理假设继续；用户答复后会以【用户的新回复】送达。`
         this.enterWait(node.id)
         try {
           const response = await this.inbox.wait(item.id, signal) as Record<string, unknown>
@@ -503,6 +516,7 @@ export class WorkflowService {
       })
     }
     if (result.agentSessionId) await this.runner.dispose(result.agentSessionId)
+    this.baselines.delete(agentRowId)
     agentRow = this.store.agentRow(agentRowId)!
     this.store.event(run.id, node.id, 'agent:end', 'RUNNING', agentRow.status, { role: agentRow.role, endKind: result.endKind, error: agentRow.error })
     const current = this.store.nodeById(node.id)!
@@ -810,6 +824,7 @@ export class WorkflowService {
 
   /** Answers to blocking items whose asking agent died with the old process (§7.5); replies that unblock C. */
   private afterResolved(item: InboxRow): void {
+    this.steerReply(item)
     if (item.kind === 'message') {
       const payload = JSON.parse(item.payload_json) as { blocked?: boolean }
       const response = JSON.parse(item.response_json ?? 'null') as { text?: string } | null
@@ -828,6 +843,25 @@ export class WorkflowService {
     const run = this.store.runById(item.run_id)
     if (agentRow?.status === 'INTERRUPTED' && run?.status === 'RUNNING') void this.resumeAgent(agentRow.id).catch(() => {})
     this.publish(item.run_id)
+  }
+
+  /**
+   * A non-blocking answer or a message reply goes straight to its agent while
+   * it is still working (DSH steering: a user message before its next step).
+   * An agent that is gone gets it on its next run (prompt) or with a later
+   * flow-tool result; a blocking answer is returned by the waiting wf_ask.
+   */
+  private steerReply(item: InboxRow): void {
+    if (!item.agent_session_id || item.response_json === null || item.delivered_at !== null) return
+    // Blocking answers return through the waiting wf_ask (or the resume prompt).
+    if ((item.kind !== 'message' && item.kind !== 'question') || item.blocking === 1) return
+    const payload = JSON.parse(item.payload_json) as Record<string, unknown>
+    const response = JSON.parse(item.response_json) as Record<string, unknown>
+    if (item.kind === 'message' && typeof response.text !== 'string') return
+    const text = item.kind === 'message'
+      ? `【用户的新回复】对你的消息「${String(payload.text).slice(0, 80)}」：${String(response.text)}`
+      : `【用户的新回复】你之前的非阻塞提问有了答复：\n${formatAnswers(payload.questions as AskQuestion[], response)}`
+    if (this.runner.steer(item.agent_session_id, text)) this.store.markDelivered([item.id])
   }
 
   // ── run controls ──────────────────────────────────────────────────────────

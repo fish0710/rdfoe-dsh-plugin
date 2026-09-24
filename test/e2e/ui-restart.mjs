@@ -7,11 +7,11 @@ await startFake()
 await setScenario([
   { match: { title: 'INT', role: 'R', resume: 0 }, calls: [
     { name: 'wf_ask', input: { questions: [{ id: 'q1', question: '重启前提出的问题：输出目录用哪个？', options: [{ label: 'src' }, { label: 'lib' }] }] } },
-    { name: 'wf_write', input: { path: '{dir}/requirement.md', content: '# 需求\n' } },
+    { name: 'write', input: { file_path: '{dir}/requirement.md', content: '# 需求\n' } },
     { name: 'wf_report', input: { summary: '需求', artifacts: [], openIssues: [], confidence: 0.8 } },
   ], say: 'r done' },
   { match: { title: 'INT', role: 'R', resume: 1 }, calls: [
-    { name: 'wf_write', input: { path: '{dir}/requirement.md', content: '# 需求（重启后续上）\n' } },
+    { name: 'write', input: { file_path: '{dir}/requirement.md', content: '# 需求（重启后续上）\n' } },
     { name: 'wf_report', input: { summary: '重启后续上完成需求录入', artifacts: [], openIssues: [], confidence: 0.8 } },
   ], say: 'r resumed' },
 ])
